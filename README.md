@@ -16,20 +16,24 @@ chmod +x /opt/scripts/boot-health-report.sh
 echo "Exit code: $?"
 
 ### Schedule it to run on every boot:
+
 cat > /etc/systemd/system/boot-health-report.service << 'EOF'
 
 [Unit]
+
 Description=Boot Health Analysis Report
 After=multi-user.target
 Wants=multi-user.target
 
 [Service]
+
 Type=oneshot
 ExecStart=/opt/scripts/boot-health-report.sh
 StandardOutput=journal
 SyslogIdentifier=boot-health
 
 [Install]
+
 WantedBy=multi-user.target
 EOF
 
