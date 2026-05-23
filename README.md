@@ -1,7 +1,9 @@
 # Enterprise Boot and System Health Analysis Tool
 
 Usage: ./boot-health-report.sh [--json] [--quiet]
+
 Output: Detailed report to stdout and /var/log/boot-health/
+
 Exit code: 0 = all healthy, 1 = warnings found, 2 = critical issues
 
 ### Save the script
@@ -15,6 +17,7 @@ echo "Exit code: $?"
 
 ### Schedule it to run on every boot:
 cat > /etc/systemd/system/boot-health-report.service << 'EOF'
+
 [Unit]
 Description=Boot Health Analysis Report
 After=multi-user.target
