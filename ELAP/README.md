@@ -1,45 +1,84 @@
 # Enterprise Linux Automation Platform (ELAP)
 
-A production-grade Linux server management platform built entirely in bash, implementing enterprise operations workflows across provisioning, security hardening, monitoring, storage management, and compliance reporting.
+A production-grade Linux server management platform implemented in Bash, automating the complete operational lifecycle across provisioning, security hardening, health monitoring, storage management, and compliance reporting.
 
-## What This Platform Does
+---
 
-ELAP automates the complete lifecycle of Linux server management:
+## Table of Contents
 
-| Capability | What It Does |
+- [Overview](#overview)
+- [Capabilities](#capabilities)
+- [Architecture](#architecture)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Design Principles](#design-principles)
+- [Technologies](#technologies)
+- [Supported Platforms](#supported-platforms)
+- [Author](#author)
+
+---
+
+## Overview
+
+ELAP provides a unified CLI interface for managing Linux infrastructure at scale. Each operational domain — provisioning, hardening, monitoring, storage, networking, user management, and performance analysis — is encapsulated in a discrete, testable component. All components share a common library for logging, locking, retry logic, and alerting, ensuring consistent behavior across the platform.
+
+---
+
+## Capabilities
+
+| Module | Description |
 |---|---|
-| **Provision** | Configures new servers with enterprise defaults — limits, kernel params, services |
-| **Harden** | Applies CIS Level 1 benchmark controls — 30+ security checks and remediations |
-| **Monitor** | Continuous health monitoring — CPU, memory, disk, services, security events |
-| **Storage** | LVM volume management — auto-expansion, snapshots, backup with verification |
-| **Network** | Layer-by-layer network diagnostics and firewall auditing |
-| **Users** | Enterprise user lifecycle — provisioning, offboarding, access auditing |
-| **Performance** | System baseline collection, bottleneck identification, kernel tuning |
-| **Report** | Comprehensive HTML reports with colour-coded status for all platform areas |
+| **Provision** | Configures new servers with enterprise defaults — system limits, kernel parameters, and service baselines |
+| **Harden** | Applies CIS Benchmark Level 1 controls — 30+ automated security checks and remediations |
+| **Monitor** | Continuous health monitoring across CPU, memory, disk, running services, and security events |
+| **Storage** | LVM volume management including auto-expansion, snapshot creation, and verified backups |
+| **Network** | Layer-by-layer network diagnostics and firewall policy auditing |
+| **Users** | Enterprise user lifecycle management — provisioning, offboarding, and access auditing |
+| **Performance** | System baseline collection, bottleneck identification, and kernel tuning recommendations |
+| **Report** | Comprehensive HTML compliance and health reports with colour-coded status indicators |
+
+---
 
 ## Architecture
-bin/
-├── elap              # Main CLI orchestrator — single entry point
-├── elap-status       # Quick platform health overview
-├── elap-provision    # Server provisioning component
-├── elap-harden       # CIS security hardening component
-├── elap-monitor      # Health monitoring component
-├── elap-storage      # Storage management component
-├── elap-network      # Network diagnostics component
-├── elap-users        # User lifecycle component
-├── elap-performance  # Performance baseline component
-└── elap-report       # HTML report generator
-lib/
-└── common.sh         # Shared library: logging, locking, retry, notifications
-config/
-├── elap.conf         # Default configuration (all thresholds configurable)
-└── server-inventory.txt
-systemd/
-├── elap-monitor.service     # Continuous monitoring daemon
-├── elap-backup.timer/.service    # Daily backups at 2am
-└── elap-compliance.timer/.service # Daily CIS audit at 6am
-tests/
-└── test-elap.sh      # Full test suite (syntax + unit tests)
+
+```
+enterprise-linux-platform/
+├── bin/
+│   ├── elap                    # Main CLI orchestrator — single entry point
+│   ├── elap-status             # Quick platform health overview
+│   ├── elap-provision          # Server provisioning component
+│   ├── elap-harden             # CIS security hardening component
+│   ├── elap-monitor            # Health monitoring component
+│   ├── elap-storage            # Storage management component
+│   ├── elap-network            # Network diagnostics component
+│   ├── elap-users              # User lifecycle component
+│   ├── elap-performance        # Performance baseline component
+│   └── elap-report             # HTML report generator
+├── lib/
+│   └── common.sh               # Shared library: logging, locking, retry, notifications
+├── config/
+│   ├── elap.conf               # Platform configuration (all thresholds tunable)
+│   └── server-inventory.txt    # Managed server inventory
+├── systemd/
+│   ├── elap-monitor.service              # Continuous monitoring daemon
+│   ├── elap-backup.timer / .service      # Daily backup job (2:00 AM)
+│   └── elap-compliance.timer / .service  # Daily CIS audit job (6:00 AM)
+└── tests/
+    └── test-elap.sh            # Full test suite — syntax validation and unit tests
+```
+
+---
+
+## Prerequisites
+
+- Linux distribution from the [Supported Platforms](#supported-platforms) list
+- `bash` 4.0 or later
+- Root or `sudo` access on the target host
+- `git` (for installation from source)
+- Optional: `lvm2` (storage module), `systemd` (daemon/timer features)
+
+---
 
 ## Installation
 
@@ -49,69 +88,85 @@ cd enterprise-linux-platform
 sudo bash install.sh
 ```
 
+The installer copies binaries to `/usr/local/bin`, installs the shared library and configuration files, and optionally enables the systemd units for continuous monitoring and scheduled compliance audits.
+
+---
+
 ## Usage
 
 ```bash
-# Quick health overview:
+# Platform health overview
 elap status
 
-# Provision a new server:
+# Provision a new server
 elap provision --hostname web01.prod --env production --role web
 
-# Apply CIS Level 1 hardening:
+# Apply CIS Level 1 security hardening
 elap harden --level 1
 
-# Audit security compliance (no changes):
+# Audit security compliance without making changes
 elap harden --audit
 
-# Run health check:
+# Run a one-time health check
 elap monitor --once
 
-# Generate HTML report:
+# Generate an HTML compliance and health report
 elap report --format html
 
-# Storage health and expansion:
+# Storage health report and automatic volume expansion
 elap storage --report
 elap storage --expand
 
-# Performance baseline:
+# Collect a performance baseline and apply kernel tuning
 elap performance --baseline
 elap performance --tune
 
-# Dry-run mode (simulate without changes):
+# Dry-run mode — simulate all changes without applying them
 ELAP_DRY_RUN=true elap harden --level 1
 ```
 
+---
+
 ## Design Principles
 
-**Idempotent** — Every operation produces the same result when run multiple times.
-No duplicate entries, no conflicting changes, safe to run repeatedly.
+**Idempotent** — Every operation produces the same outcome regardless of how many times it is executed. No duplicate entries, no conflicting changes; operations are safe to run repeatedly as part of automated pipelines.
 
-**Observable** — Every action is logged with timestamp, component, and result.
-Logs ship to journald automatically when running as a systemd service.
+**Observable** — Every action is recorded with a timestamp, component name, and result code. When running as a systemd service, logs are forwarded automatically to `journald` for centralized collection.
 
-**Safe** — All scripts use `set -euo pipefail`. Lock files prevent concurrent
-execution. Dry-run mode available for every operation. Backups created before changes.
+**Safe** — All scripts enforce `set -euo pipefail`. Exclusive lock files prevent concurrent execution of the same operation. Dry-run mode is available for every module. Backups are created automatically before any destructive change is applied.
 
-**Testable** — Complete test suite validates structure, syntax, and core library
-functions. Run with `bash tests/test-elap.sh`.
+**Testable** — A complete test suite validates script structure, syntax correctness, and core library functions. Execute with:
 
-## Technologies Demonstrated
+```bash
+bash tests/test-elap.sh
+```
 
-- Advanced bash scripting with error handling, traps, and parallel execution
+---
+
+## Technologies
+
+- Advanced Bash scripting — error handling, signal traps, and parallel execution
 - Linux process management via systemd unit files, timers, and cgroups
-- Storage management via LVM — online expansion, snapshots, automated backup
-- Network diagnostics at each OSI layer
-- Security hardening against CIS Linux Benchmark Level 1
-- SELinux policy validation and auditd rule management
-- Performance analysis using iostat, vmstat, sar, and /proc
-- PAM and sudoers configuration for enterprise access control
+- LVM storage management — online volume expansion, snapshots, and automated backup with verification
+- Network diagnostics across OSI layers using standard Linux tooling
+- Security hardening aligned to the CIS Linux Benchmark Level 1
+- SELinux policy validation and `auditd` rule management
+- Performance analysis using `iostat`, `vmstat`, `sar`, and `/proc` interfaces
+- PAM and `sudoers` configuration for enterprise access control
 
-## Target Environments
+---
 
-Tested on: RHEL 8/9, CentOS Stream 8/9, Ubuntu 20.04 LTS, Ubuntu 22.04 LTS,
-Amazon Linux 2, Amazon Linux 2023
+## Supported Platforms
+
+| Distribution | Versions |
+|---|---|
+| Red Hat Enterprise Linux | 8, 9 |
+| CentOS Stream | 8, 9 |
+| Ubuntu LTS | 20.04, 22.04 |
+| Amazon Linux | 2, 2023 |
+
+---
 
 ## Author
 
-Dipak Prasad — Senior Infrastructure Engineer
+**Dipak Prasad** — Senior Infrastructure Engineer
