@@ -1,0 +1,192 @@
+# ─────────────────────────────────────────────────────────────
+# File: bin/elap-report
+# Purpose: Generate comprehensive platform HTML report
+# ─────────────────────────────────────────────────────────────
+cat > bin/elap-report << 'REPEOF'
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
+export ELAP_COMPONENT="elap-report"
+
+FORMAT="html"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --format) FORMAT="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+
+mkdir -p "$ELAP_REPORT_DIR"
+REPORT="${ELAP_REPORT_DIR}/elap-report-$(date +%Y%m%d-%H%M%S).html"
+
+log_info "Generating comprehensive platform report"
+log_info "Format: $FORMAT | Output: $REPORT"
+
+# Collect all data:
+HOSTNAME=$(hostname -f)
+OS=$(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"')
+KERNEL=$(uname -r)
+UPTIME=$(uptime -p)
+CORES=$(nproc)
+LOAD=$(awk '{print $1, $2, $3}' /proc/loadavg)
+MEM_TOTAL=$(free -h | awk '/Mem/{print $2}')
+MEM_AVAIL=$(free -h | awk '/Mem/{print $7}')
+SWAP_USED=$(free -h | awk '/Swap/{print $3}')
+
+# Generate HTML report:
+cat > "$REPORT" << HTMLEOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ELAP Platform Report — $HOSTNAME</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif;
+         background:#0f1117; color:#e2e8f0; padding:24px; }
+  h1   { font-size:24px; color:#60a5fa; margin-bottom:4px; }
+  h2   { font-size:16px; color:#94a3b8; margin:24px 0 12px; 
+         padding-bottom:6px; border-bottom:1px solid #1e293b; }
+  .meta { color:#64748b; font-size:13px; margin-bottom:24px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+          gap:16px; margin-bottom:24px; }
+  .card { background:#1e293b; border-radius:8px; padding:16px;
+          border-left:3px solid #3b82f6; }
+  .card.ok   { border-color:#22c55e; }
+  .card.warn { border-color:#f59e0b; }
+  .card.crit { border-color:#ef4444; }
+  .card-label { font-size:11px; color:#64748b; text-transform:uppercase;
+                letter-spacing:.05em; margin-bottom:4px; }
+  .card-value { font-size:22px; font-weight:700; }
+  .card-detail { font-size:12px; color:#94a3b8; margin-top:4px; }
+  table { width:100%; border-collapse:collapse; margin-bottom:16px;
+          background:#1e293b; border-radius:8px; overflow:hidden; }
+  th    { background:#0f172a; padding:10px 12px; text-align:left;
+          font-size:12px; color:#64748b; text-transform:uppercase; }
+  td    { padding:10px 12px; border-bottom:1px solid #0f172a;
+          font-size:13px; }
+  tr:last-child td { border:none; }
+  .ok   { color:#22c55e; } .warn { color:#f59e0b; } .crit { color:#ef4444; }
+  .badge { padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; }
+  .badge.ok   { background:#14532d; color:#86efac; }
+  .badge.warn { background:#78350f; color:#fcd34d; }
+  .badge.crit { background:#7f1d1d; color:#fca5a5; }
+  pre { background:#0f172a; padding:12px; border-radius:6px; 
+        font-size:12px; overflow-x:auto; color:#94a3b8; }
+</style>
+</head>
+<body>
+
+<h1>ELAP Platform Report</h1>
+<div class="meta">
+  Generated: $(date) &nbsp;|&nbsp;
+  Host: <strong>$HOSTNAME</strong> &nbsp;|&nbsp;
+  OS: $OS &nbsp;|&nbsp;
+  Kernel: $KERNEL &nbsp;|&nbsp;
+  Uptime: $UPTIME
+</div>
+
+<h2>System Overview</h2>
+<div class="grid">
+  <div class="card $(
+    LOAD_INT="${LOAD%% *}"; LOAD_INT="${LOAD_INT%.*}"
+    [[ "${LOAD_INT:-0}" -gt "$CORES" ]] && echo "warn" || echo "ok"
+  )">
+    <div class="card-label">CPU Load</div>
+    <div class="card-value">$LOAD</div>
+    <div class="card-detail">$CORES cores</div>
+  </div>
+  <div class="card $(
+    MEM_AVAIL_MB=$(free -m | awk '/Mem/{print $7}')
+    MEM_TOTAL_MB=$(free -m | awk '/Mem/{print $2}')
+    PCT=$((MEM_AVAIL_MB*100/MEM_TOTAL_MB))
+    [[ $PCT -lt 15 ]] && echo "crit" || [[ $PCT -lt 25 ]] && echo "warn" || echo "ok"
+  )">
+    <div class="card-label">Memory Available</div>
+    <div class="card-value">$MEM_AVAIL</div>
+    <div class="card-detail">of $MEM_TOTAL total | Swap: $SWAP_USED</div>
+  </div>
+  <div class="card $(
+    FAILED=$(systemctl --failed --no-legend 2>/dev/null | wc -l)
+    [[ "$FAILED" -gt 0 ]] && echo "crit" || echo "ok"
+  )">
+    <div class="card-label">Failed Services</div>
+    <div class="card-value">$(systemctl --failed --no-legend 2>/dev/null | wc -l)</div>
+    <div class="card-detail">systemd units in failed state</div>
+  </div>
+  <div class="card $(getenforce 2>/dev/null | grep -q Enforcing && echo ok || echo warn)">
+    <div class="card-label">SELinux</div>
+    <div class="card-value">$(getenforce 2>/dev/null || echo Unknown)</div>
+    <div class="card-detail">Mandatory access control</div>
+  </div>
+</div>
+
+<h2>Disk Usage</h2>
+<table>
+  <thead><tr><th>Mount Point</th><th>Filesystem</th><th>Size</th><th>Used</th><th>Available</th><th>Usage</th><th>Status</th></tr></thead>
+  <tbody>
+$(df -hT | grep -vE "tmpfs|devtmpfs|Filesystem" | awk '
+  NR>0 {
+    pct=$6+0
+    status = (pct>=90) ? "crit" : (pct>=80) ? "warn" : "ok"
+    label  = (pct>=90) ? "CRITICAL" : (pct>=80) ? "WARNING" : "OK"
+    printf "    <tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td><span class=\"badge %s\">%s</span></td></tr>\n",
+           $7, $2, $3, $4, $5, $6, status, label
+  }')
+  </tbody>
+</table>
+
+<h2>Top Processes — CPU</h2>
+<table>
+  <thead><tr><th>Process</th><th>PID</th><th>User</th><th>CPU%</th><th>MEM%</th><th>RSS</th></tr></thead>
+  <tbody>
+$(ps aux --sort=-%cpu --no-headers | head -8 | awk '
+  {printf "    <tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%sMB</td></tr>\n",
+          $11, $2, $1, $3, $4, int($6/1024)}')
+  </tbody>
+</table>
+
+<h2>Service Status</h2>
+<table>
+  <thead><tr><th>Service</th><th>Status</th><th>Enabled</th></tr></thead>
+  <tbody>
+$(for svc in sshd auditd rsyslog crond chronyd firewalld fail2ban; do
+    systemctl list-unit-files 2>/dev/null | grep -q "^${svc}" || continue
+    active=$(systemctl is-active "$svc" 2>/dev/null || echo "inactive")
+    enabled=$(systemctl is-enabled "$svc" 2>/dev/null || echo "disabled")
+    badge=$([ "$active" = "active" ] && echo "ok" || echo "crit")
+    echo "    <tr><td>$svc</td><td><span class=\"badge $badge\">$active</span></td><td>$enabled</td></tr>"
+done)
+  </tbody>
+</table>
+
+<h2>Recent System Events</h2>
+<pre>$(journalctl -p err --since "24 hours ago" --no-pager 2>/dev/null | \
+    grep -v "^--" | tail -15 || echo "No errors in last 24 hours")</pre>
+
+<h2>Network Connections</h2>
+<pre>$(ss -s 2>/dev/null | head -10)</pre>
+
+<h2>Kernel Messages</h2>
+<pre>$(dmesg -T --level=err,crit 2>/dev/null | tail -10 || echo "No kernel errors")</pre>
+
+<div style="margin-top:32px; padding-top:16px; border-top:1px solid #1e293b;
+     font-size:12px; color:#475569;">
+  Generated by ELAP v$(cat "$ELAP_HOME/VERSION" 2>/dev/null || echo "1.0.0") &nbsp;|&nbsp;
+  Enterprise Linux Automation Platform &nbsp;|&nbsp;
+  $(date)
+</div>
+
+</body>
+</html>
+HTMLEOF
+
+log_info "Report generated: $REPORT"
+echo ""
+echo "Open in browser: file://$REPORT"
+REPEOF
+
+chmod +x bin/elap-report
+echo "✓ bin/elap-report created"

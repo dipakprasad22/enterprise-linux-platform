@@ -1,0 +1,311 @@
+#!/bin/bash
+# ELAP Performance Component
+# System performance baseline, diagnosis, and tuning
+# Usage: elap performance [--baseline] [--tune] [--diagnose]
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# shellcheck disable=SC1091
+# shellcheck source=../lib/common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
+export ELAP_COMPONENT="elap-performance"
+
+MODE="baseline"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --baseline) MODE="baseline"; shift ;;
+        --tune)     MODE="tune";     shift ;;
+        --diagnose) MODE="diagnose"; shift ;;
+        --help)
+            echo "Usage: elap performance [--baseline|--tune|--diagnose]"
+            exit 0 ;;
+        *) log_error "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+BASELINE_DIR="${ELAP_DATA_DIR:-/var/lib/elap}/baselines"
+mkdir -p "$BASELINE_DIR"
+
+# ── Performance baseline ──────────────────────────────────────
+collect_baseline() {
+    local timestamp
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    local baseline_file="${BASELINE_DIR}/baseline-${timestamp}.txt"
+
+    log_info "Collecting performance baseline"
+
+    {
+        echo "ELAP Performance Baseline"
+        echo "Timestamp: $(date)"
+        echo "Host: $(hostname -f)"
+        echo "OS: $(grep PRETTY_NAME /etc/os-release | \
+            cut -d= -f2 | tr -d '"')"
+        echo "Kernel: $(uname -r)"
+        echo "CPU cores: $(nproc)"
+        echo ""
+
+        # CPU:
+        echo "── CPU ──"
+        local load cores ratio
+        load=$(awk '{print $1}' /proc/loadavg)
+        cores=$(nproc)
+        ratio=$(echo "scale=2; $load/$cores" | bc 2>/dev/null || echo "?")
+        echo "Load average: $load (1min) | cores: $cores | ratio: $ratio"
+        echo "CPU model: $(grep "model name" /proc/cpuinfo | \
+            head -1 | cut -d: -f2 | xargs)"
+        echo ""
+
+        # Memory:
+        echo "── Memory ──"
+        free -h
+        echo ""
+        grep -E "^(MemTotal|MemAvailable|SwapTotal|SwapFree|Dirty)" \
+            /proc/meminfo
+        echo ""
+
+        # Disk:
+        echo "── Disk ──"
+        df -hT | grep -vE "tmpfs|devtmpfs"
+        echo ""
+
+        # I/O:
+        echo "── I/O (3 second sample) ──"
+        iostat -x 1 3 2>/dev/null | \
+            grep -v "^$\|^Linux" | tail -20 || \
+            echo "iostat not available"
+        echo ""
+
+        # Network:
+        echo "── Network ──"
+        ss -s 2>/dev/null
+        echo ""
+
+        # Kernel tuning parameters:
+        echo "── Kernel Parameters ──"
+        for p in \
+            vm.swappiness \
+            vm.dirty_ratio \
+            net.core.somaxconn \
+            net.ipv4.tcp_fin_timeout \
+            net.ipv4.ip_local_port_range \
+            net.ipv4.tcp_tw_reuse \
+            fs.file-max \
+            kernel.randomize_va_space; do
+            printf "  %-40s = %s\n" "$p" \
+                "$(sysctl -n $p 2>/dev/null || echo 'not set')"
+        done
+        echo ""
+
+        # Top processes by CPU:
+        echo "── Top CPU Processes ──"
+        ps aux --sort=-%cpu --no-headers | head -8 | \
+            awk '{printf "  %5s%% %-25s PID:%-8s MEM:%s%%\n",
+                 $3,$11,$2,$4}'
+        echo ""
+
+        # Top processes by Memory:
+        echo "── Top Memory Processes ──"
+        ps aux --sort=-%mem --no-headers | head -8 | \
+            awk '{printf "  %5s%% %-25s PID:%-8s RSS:%sMB\n",
+                 $4,$11,$2,int($6/1024)}'
+
+    } | tee "$baseline_file"
+
+    log_info "Baseline saved: $baseline_file"
+}
+
+# ── Performance tuning ────────────────────────────────────────
+apply_tuning() {
+    elap_require_root
+    log_info "Applying recommended performance tuning"
+
+    local tuning_file="/etc/sysctl.d/99-elap-performance.conf"
+
+    # Backup existing:
+    [[ -f "$tuning_file" ]] && \
+        cp "$tuning_file" "${tuning_file}.bak.$(date +%Y%m%d)"
+
+    cat > "$tuning_file" << 'SYSCTL'
+# ELAP Performance Tuning
+# Applied by: elap performance --tune
+
+# Virtual memory:
+vm.swappiness = 10
+vm.dirty_ratio = 15
+vm.dirty_background_ratio = 5
+
+# File system:
+fs.file-max = 2097152
+fs.inotify.max_user_watches = 524288
+
+# Network — connection handling:
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65536
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# Network — connection reuse:
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 1024 65535
+
+# Network — buffers:
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+
+# Network — keepalive:
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 60
+net.ipv4.tcp_keepalive_probes = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+SYSCTL
+
+    elap_run sysctl --system > /dev/null
+    log_apply "Performance tuning applied: $tuning_file"
+
+    # I/O scheduler:
+    log_info "Configuring I/O schedulers"
+    for disk in /sys/block/nvme*/queue/scheduler \
+                /sys/block/sd*/queue/scheduler; do
+        [[ -f "$disk" ]] || continue
+        local dev
+        dev=$(echo "$disk" | grep -o "nvme[0-9]*\|sd[a-z]*" | head -1)
+        local rotational
+        rotational=$(cat "/sys/block/${dev}/queue/rotational" 2>/dev/null || echo 1)
+
+        if [[ "$dev" == nvme* ]]; then
+            elap_run bash -c "echo none > $disk" || true
+            log_apply "NVMe ${dev}: scheduler=none"
+        elif [[ "$rotational" == "0" ]]; then
+            elap_run bash -c "echo mq-deadline > $disk" || true
+            log_apply "SSD ${dev}: scheduler=mq-deadline"
+        else
+            elap_run bash -c "echo bfq > $disk" || true
+            log_apply "HDD ${dev}: scheduler=bfq"
+        fi
+    done
+
+    log_info "Performance tuning complete"
+    log_info "Run 'elap performance --baseline' to verify improvements"
+}
+
+# ── Full diagnosis ────────────────────────────────────────────
+run_diagnosis() {
+    elap_section "CPU Analysis"
+
+    local cores load ratio
+    cores=$(nproc)
+    load=$(awk '{print $1}' /proc/loadavg)
+    ratio=$(echo "scale=2; $load/$cores" | bc 2>/dev/null || echo "?")
+
+    log_info "Load: $load | Cores: $cores | Ratio: $ratio"
+    [[ $(echo "$ratio > 1.0" | bc -l 2>/dev/null || echo 0) -eq 1 ]] && \
+        log_warn "CPU SATURATED — processes waiting for CPU time"
+
+    local iowait
+    iowait=$(top -bn1 2>/dev/null | grep "Cpu" | \
+        awk '{for(i=1;i<=NF;i++) if($i~/wa,/) print $(i-1)}' | \
+        head -1 | tr -d '%,')
+    log_info "I/O wait: ${iowait:-unknown}%"
+    [[ "${iowait:-0}" -gt 20 ]] 2>/dev/null && \
+        log_warn "HIGH I/O WAIT — storage bottleneck likely"
+
+    elap_section "Memory Analysis"
+
+    local avail total pct
+    avail=$(free -m | awk '/Mem/{print $7}')
+    total=$(free -m | awk '/Mem/{print $2}')
+    pct=$((avail * 100 / total))
+    log_info "Available: ${avail}MB (${pct}% of ${total}MB)"
+    [[ $pct -lt 15 ]] && log_warn "LOW MEMORY — ${pct}% available"
+
+    local swap
+    swap=$(free -m | awk '/Swap/{print $3}')
+    [[ "${swap:-0}" -gt 0 ]] && \
+        log_warn "SWAPPING: ${swap}MB swap in use" || \
+        log_pass "No swap activity"
+
+    local oom_count
+    oom_count=$(dmesg 2>/dev/null | \
+        grep -c "Out of memory\|Killed process" || echo 0)
+    [[ "${oom_count:-0}" -gt 0 ]] && \
+        log_error "OOM EVENTS: $oom_count kill(s) in kernel log"
+
+    elap_section "Disk I/O Analysis"
+
+    if command -v iostat &>/dev/null; then
+        log_info "I/O statistics (5 second sample):"
+        iostat -x 1 5 2>/dev/null | \
+            awk '/^Device/{found=1} found && /[a-z]/{
+                util=$14+0; await=($6+$7)/2
+                if(util>50 || await>20)
+                    printf "  WARN %s: util=%s%% await=%.1fms\n",
+                           $1,util,await
+                else
+                    printf "  OK   %s: util=%s%% await=%.1fms\n",
+                           $1,util,await
+            }' | head -10
+    else
+        log_warn "iostat not available — install sysstat package"
+    fi
+
+    elap_section "Network Analysis"
+
+    local established time_wait
+    established=$(ss -tan state established 2>/dev/null | wc -l)
+    time_wait=$(ss -tan state time-wait 2>/dev/null | wc -l)
+    log_info "Established: $established | TIME_WAIT: $time_wait"
+    [[ "${time_wait:-0}" -gt 5000 ]] && \
+        log_warn "HIGH TIME_WAIT: consider net.ipv4.tcp_tw_reuse=1"
+
+    elap_section "Top Resource Consumers"
+
+    echo "Top 5 CPU:"
+    ps aux --sort=-%cpu --no-headers | head -5 | \
+        awk '{printf "  %5s%% %-25s (PID %s)\n",$3,$11,$2}'
+
+    echo ""
+    echo "Top 5 Memory:"
+    ps aux --sort=-%mem --no-headers | head -5 | \
+        awk '{printf "  %5s%% %-25s (PID %s, RSS %sMB)\n",
+             $4,$11,$2,int($6/1024)}'
+
+    elap_section "Recommendations"
+
+    local rec_count=0
+
+    local swap_val
+    swap_val=$(sysctl -n vm.swappiness 2>/dev/null || echo 60)
+    [[ "${swap_val:-60}" -gt 20 ]] && {
+        log_warn "vm.swappiness=$swap_val — run 'elap performance --tune'"
+        ((rec_count++))
+    }
+
+    local time_wait_check
+    time_wait_check=$(ss -tan state time-wait 2>/dev/null | wc -l)
+    [[ "${time_wait_check:-0}" -gt 5000 ]] && {
+        log_warn "High TIME_WAIT — run 'elap performance --tune'"
+        ((rec_count++))
+    }
+
+    local sysstat_ok
+    systemctl is-active --quiet sysstat 2>/dev/null && \
+        sysstat_ok=true || sysstat_ok=false
+    [[ "$sysstat_ok" == "false" ]] && {
+        log_warn "sysstat not running — historical data unavailable"
+        log_warn "Fix: systemctl enable --now sysstat"
+        ((rec_count++))
+    }
+
+    [[ $rec_count -eq 0 ]] && \
+        log_pass "No immediate performance recommendations"
+}
+
+# ── Dispatch ──────────────────────────────────────────────────
+case "$MODE" in
+    baseline) collect_baseline ;;
+    tune)     apply_tuning ;;
+    diagnose) run_diagnosis ;;
+esac

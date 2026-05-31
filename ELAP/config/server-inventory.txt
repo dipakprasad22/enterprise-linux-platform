@@ -1,0 +1,9 @@
+# Server inventory file:
+# ELAP Server Inventory
+# Format: hostname role environment
+# Lines starting with # are comments
+
+# web-01.prod.company.com   web         production
+# web-02.prod.company.com   web         production
+# app-01.prod.company.com   application production
+# db-01.prod.company.com    database    production

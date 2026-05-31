@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────
+# Systemd unit files for the ELAP platform
+# ─────────────────────────────────────────────────────────────
+
+# Continuous monitoring service:
+[Unit]
+Description=ELAP Continuous Health Monitor
+Documentation=https://github.com/dipak/enterprise-linux-platform
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/enterprise-linux-platform/bin/elap monitor --watch
+Restart=on-failure
+RestartSec=30s
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+Environment=ELAP_MONITOR_INTERVAL=60
+EnvironmentFile=-/etc/elap/elap.conf
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=elap-monitor
+
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

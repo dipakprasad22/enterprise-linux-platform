@@ -1,0 +1,156 @@
+# ─────────────────────────────────────────────────────────────
+# File: bin/elap-monitor
+# Purpose: Comprehensive system health monitoring
+# ─────────────────────────────────────────────────────────────
+cat > bin/elap-monitor << 'MONEOF'
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
+export ELAP_COMPONENT="elap-monitor"
+
+MODE="once"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --once)   MODE="once";   shift ;;
+        --watch)  MODE="watch";  shift ;;
+        --report) MODE="report"; shift ;;
+        *) shift ;;
+    esac
+done
+
+PASS=0; WARN=0; CRIT=0
+
+check() {
+    local label="$1" status="$2" detail="$3"
+    case "$status" in
+        pass) log_pass "$label: $detail"; ((PASS++)) ;;
+        warn) log_warn "$label: $detail"; ((WARN++)) ;;
+        crit) log_error "$label: $detail [CRITICAL]"; ((CRIT++)) ;;
+    esac
+}
+
+run_checks() {
+    PASS=0; WARN=0; CRIT=0
+
+    # CPU:
+    CORES=$(nproc)
+    LOAD=$(awk '{print $1}' /proc/loadavg)
+    LOAD_INT="${LOAD%.*}"
+    if   [[ "${LOAD_INT:-0}" -gt "$((CORES*2))" ]]; then
+        check "CPU Load" "crit" "Load $LOAD / $CORES cores"
+    elif [[ "${LOAD_INT:-0}" -gt "$CORES" ]]; then
+        check "CPU Load" "warn" "Load $LOAD / $CORES cores"
+    else
+        check "CPU Load" "pass" "Load $LOAD / $CORES cores"
+    fi
+
+    # Memory:
+    MEM_AVAIL=$(free -m | awk '/Mem/{print $7}')
+    MEM_TOTAL=$(free -m | awk '/Mem/{print $2}')
+    MEM_PCT=$((MEM_AVAIL*100/MEM_TOTAL))
+    SWAP=$(free -m | awk '/Swap/{print $3}')
+    if   [[ $MEM_PCT -lt 10 ]]; then
+        check "Memory" "crit" "Only ${MEM_PCT}% available"
+    elif [[ $MEM_PCT -lt 20 ]] || [[ "${SWAP:-0}" -gt 100 ]]; then
+        check "Memory" "warn" "${MEM_PCT}% available, ${SWAP}MB swap"
+    else
+        check "Memory" "pass" "${MEM_AVAIL}MB available"
+    fi
+
+    # Disk:
+    while IFS= read -r line; do
+        mnt=$(echo "$line" | awk '{print $6}')
+        pct=$(echo "$line" | awk '{print $5}' | tr -d '%')
+        [[ -z "${pct:-}" ]] && continue
+        if   [[ ${pct} -ge 95 ]]; then check "Disk $mnt" "crit" "${pct}%"
+        elif [[ ${pct} -ge 80 ]]; then check "Disk $mnt" "warn" "${pct}%"
+        else                           check "Disk $mnt" "pass" "${pct}%"
+        fi
+    done < <(df -h | grep -vE "tmpfs|devtmpfs|Filesystem" | tail -n +2)
+
+    # Inodes:
+    while IFS= read -r line; do
+        mnt=$(echo "$line" | awk '{print $6}')
+        pct=$(echo "$line" | awk '{print $5}' | tr -d '%')
+        [[ "${pct:-0}" -ge 80 ]] && \
+            check "Inodes $mnt" "warn" "${pct}% used"
+    done < <(df -ih | grep -vE "tmpfs|devtmpfs|Filesystem|^-" | tail -n +2)
+
+    # Failed services:
+    FAILED=$(systemctl --failed --no-legend 2>/dev/null | wc -l)
+    [[ "$FAILED" -gt 0 ]] && \
+        check "Failed Services" "crit" "$FAILED failed" || \
+        check "Failed Services" "pass" "none"
+
+    # OOM events:
+    OOM=$(dmesg 2>/dev/null | grep -c "Out of memory\|Killed process" || echo 0)
+    [[ "${OOM:-0}" -gt 0 ]] && \
+        check "OOM Events" "crit" "$OOM events" || \
+        check "OOM Events" "pass" "none"
+
+    # Critical services:
+    for svc in sshd auditd rsyslog; do
+        systemctl list-unit-files 2>/dev/null | grep -q "^${svc}" || continue
+        systemctl is-active --quiet "$svc" 2>/dev/null && \
+            check "Service $svc" "pass" "running" || \
+            check "Service $svc" "crit" "NOT RUNNING"
+    done
+
+    # Network gateway:
+    GW=$(ip route | grep default | awk '{print $3}' | head -1)
+    if [[ -n "${GW:-}" ]] && ping -c 1 -W 2 "$GW" &>/dev/null 2>&1; then
+        check "Gateway" "pass" "$GW reachable"
+    else
+        check "Gateway" "crit" "unreachable"
+    fi
+
+    # Zombie processes:
+    ZOMBIES=$(ps aux | awk '$8 ~ /Z/' | wc -l)
+    [[ "${ZOMBIES:-0}" -gt 10 ]] && \
+        check "Zombies" "warn" "$ZOMBIES zombie processes" || \
+        check "Zombies" "pass" "$ZOMBIES zombie processes"
+
+    # Summary:
+    log_info "Health check: $PASS passed · $WARN warnings · $CRIT critical"
+
+    # Alert if critical:
+    [[ "$CRIT" -gt 0 ]] && \
+        elap_notify "ERROR" "$CRIT critical health check(s) on $(hostname -s)"
+    [[ "$WARN" -gt 0 && "$CRIT" -eq 0 ]] && \
+        elap_notify "WARN" "$WARN warning(s) on $(hostname -s)"
+
+    return "$CRIT"
+}
+
+case "$MODE" in
+    once)
+        log_info "Running single health check"
+        run_checks
+        ;;
+    watch)
+        INTERVAL="${ELAP_MONITOR_INTERVAL:-60}"
+        log_info "Starting continuous monitoring (interval: ${INTERVAL}s)"
+        while true; do
+            run_checks || true
+            sleep "$INTERVAL"
+        done
+        ;;
+    report)
+        log_info "Generating health report"
+        run_checks || true
+        REPORT_FILE="${ELAP_REPORT_DIR}/health-$(date +%Y%m%d-%H%M%S).txt"
+        mkdir -p "$ELAP_REPORT_DIR"
+        {
+            echo "ELAP Health Report"
+            echo "Generated: $(date)"
+            echo "Host: $(hostname -f)"
+            echo "Results: $PASS passed · $WARN warnings · $CRIT critical"
+        } > "$REPORT_FILE"
+        log_info "Report: $REPORT_FILE"
+        ;;
+esac
+MONEOF
+
+chmod +x bin/elap-monitor
+echo "✓ bin/elap-monitor created"

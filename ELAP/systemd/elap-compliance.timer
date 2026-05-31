@@ -1,0 +1,21 @@
+# Daily compliance check timer:
+[Unit]
+Description=ELAP Daily CIS Compliance Check
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+cat > systemd/elap-compliance.service << 'EOF'
+[Unit]
+Description=ELAP CIS Compliance Check
+
+[Service]
+Type=oneshot
+ExecStart=/opt/enterprise-linux-platform/bin/elap harden --audit
+StandardOutput=journal
+SyslogIdentifier=elap-compliance

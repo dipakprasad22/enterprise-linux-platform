@@ -1,0 +1,210 @@
+#!/bin/bash
+# ELAP Network Component
+# Layer-by-layer network diagnostics and security audit
+# Usage: elap network [--diagnose] [--report] [--firewall]
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# shellcheck disable=SC1091
+# shellcheck source=../lib/common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
+export ELAP_COMPONENT="elap-network"
+
+MODE="report"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --diagnose) MODE="diagnose"; shift ;;
+        --report)   MODE="report";   shift ;;
+        --firewall) MODE="firewall"; shift ;;
+        --help)
+            echo "Usage: elap network [--diagnose|--report|--firewall]"
+            exit 0 ;;
+        *) log_error "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+PASS=0; WARN=0; FAIL=0
+
+net_check() {
+    local label="$1" status="$2" detail="$3"
+    case "$status" in
+        pass) log_pass "$label: $detail"; ((PASS++)) ;;
+        warn) log_warn "$label: $detail"; ((WARN++)) ;;
+        fail) log_error "$label: $detail"; ((FAIL++)) ;;
+    esac
+}
+
+# ── Layer-by-layer diagnosis ──────────────────────────────────
+diagnose() {
+    elap_section "Layer 1/2 — Physical and Link"
+
+    while IFS= read -r line; do
+        local iface
+        iface=$(echo "$line" | awk -F': ' '{print $2}' | awk '{print $1}')
+        [[ -z "$iface" || "$iface" == "lo" ]] && continue
+
+        if ip link show "$iface" 2>/dev/null | grep -q "state UP"; then
+            local errors drops
+            errors=$(ip -s link show "$iface" 2>/dev/null | \
+                grep -A1 "RX:" | tail -1 | awk '{print $3}')
+            drops=$(ip -s link show "$iface" 2>/dev/null | \
+                grep -A1 "RX:" | tail -1 | awk '{print $4}')
+
+            if [[ "${errors:-0}" -gt 0 || "${drops:-0}" -gt 0 ]]; then
+                net_check "$iface" "warn" \
+                    "UP — RX errors:${errors} drops:${drops}"
+            else
+                net_check "$iface" "pass" "UP — no errors"
+            fi
+        else
+            net_check "$iface" "warn" "DOWN or no carrier"
+        fi
+    done < <(ip link show | grep "^[0-9]")
+
+    elap_section "Layer 3 — Network (IP and Routing)"
+
+    # IP addresses:
+    log_info "Configured IPs:"
+    ip addr show | grep "inet " | grep -v "127.0.0.1" | \
+        awk '{printf "  %-20s on %s\n", $2, $NF}'
+
+    # Default gateway:
+    local gw
+    gw=$(ip route | grep default | awk '{print $3}' | head -1)
+    if [[ -n "${gw:-}" ]]; then
+        if ping -c 1 -W 2 "$gw" &>/dev/null 2>&1; then
+            net_check "Default gateway" "pass" "$gw reachable"
+        else
+            net_check "Default gateway" "fail" "$gw UNREACHABLE"
+        fi
+    else
+        net_check "Default gateway" "fail" "no default route configured"
+    fi
+
+    # Internet reachability:
+    if ping -c 1 -W 3 8.8.8.8 &>/dev/null 2>&1; then
+        net_check "Internet (8.8.8.8)" "pass" "reachable"
+    else
+        net_check "Internet (8.8.8.8)" "warn" "not reachable"
+    fi
+
+    elap_section "Layer 4 — Transport (Ports and Connections)"
+
+    log_info "Listening TCP ports:"
+    ss -tlnp | tail -n +2 | while IFS= read -r line; do
+        local port proc addr
+        port=$(echo "$line" | awk '{print $4}' | awk -F: '{print $NF}')
+        proc=$(echo "$line" | grep -o 'comm="[^"]*"' | \
+            cut -d'"' -f2 2>/dev/null || echo "unknown")
+        addr=$(echo "$line" | awk '{print $4}' | sed 's/:[^:]*$//')
+        printf "  Port %-6s %-20s addr:%s\n" "$port" "$proc" "$addr"
+    done
+
+    # Connection summary:
+    local established time_wait close_wait
+    established=$(ss -tan state established 2>/dev/null | wc -l)
+    time_wait=$(ss -tan state time-wait 2>/dev/null | wc -l)
+    close_wait=$(ss -tan state close-wait 2>/dev/null | wc -l)
+
+    log_info "Connection states: EST=$established TW=$time_wait CW=$close_wait"
+
+    [[ "${time_wait:-0}" -gt 10000 ]] && \
+        net_check "TIME_WAIT count" "warn" \
+        "$time_wait — consider net.ipv4.tcp_tw_reuse=1"
+
+    [[ "${close_wait:-0}" -gt 1000 ]] && \
+        net_check "CLOSE_WAIT count" "warn" \
+        "$close_wait — application may not be closing connections"
+
+    elap_section "Layer 7 — Application (DNS)"
+
+    # DNS servers:
+    while IFS= read -r ns; do
+        if dig +short +time=3 google.com @"$ns" &>/dev/null; then
+            net_check "DNS server $ns" "pass" "responding"
+        else
+            net_check "DNS server $ns" "fail" "not responding"
+        fi
+    done < <(grep "^nameserver" /etc/resolv.conf | awk '{print $2}')
+
+    # DNS resolution:
+    local resolved
+    resolved=$(dig +short +time=3 google.com A 2>/dev/null | head -1)
+    [[ -n "${resolved:-}" ]] && \
+        net_check "DNS resolution" "pass" "google.com → $resolved" || \
+        net_check "DNS resolution" "fail" "cannot resolve google.com"
+}
+
+# ── Full network health report ─────────────────────────────────
+network_report() {
+    diagnose
+
+    elap_section "Network Performance"
+
+    # Check for high error rates on interfaces:
+    ip -s link show | awk '
+        /^[0-9]+: / {iface=$2}
+        /RX:/ {getline
+            if($3+0>100) printf "  RX errors on %s: %s\n", iface, $3}
+        /TX:/ {getline
+            if($3+0>100) printf "  TX errors on %s: %s\n", iface, $3}
+    '
+
+    elap_section "Summary"
+    log_info "Network check: $PASS passed · $WARN warnings · $FAIL failed"
+}
+
+# ── Firewall audit ────────────────────────────────────────────
+firewall_audit() {
+    elap_section "Firewall Status"
+
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        log_info "firewalld is active"
+        echo ""
+        echo "Active zones:"
+        firewall-cmd --get-active-zones 2>/dev/null || true
+        echo ""
+        echo "Default zone services:"
+        firewall-cmd --list-services 2>/dev/null | \
+            tr ' ' '\n' | sed 's/^/  /'
+        echo ""
+        echo "Open ports:"
+        firewall-cmd --list-ports 2>/dev/null | \
+            tr ' ' '\n' | sed 's/^/  /'
+    else
+        log_info "iptables rules:"
+        iptables -L INPUT -n --line-numbers 2>/dev/null | head -20
+    fi
+
+    elap_section "Unexpected Open Ports"
+
+    # Check for risky ports that should not be open:
+    local risky_ports=(21 23 25 69 111 135 139 445 512 513 514 3389 5900)
+    local found_risky=0
+    for port in "${risky_ports[@]}"; do
+        if ss -tlnp | grep -q ":${port} "; then
+            log_warn "Risky port $port is open — verify this is intentional"
+            ((found_risky++))
+        fi
+    done
+    [[ $found_risky -eq 0 ]] && \
+        log_pass "No unexpected risky ports open"
+
+    elap_section "Recent Connection Attempts"
+
+    # Failed connection attempts from auth log:
+    local fail_count
+    fail_count=$(journalctl --since "1 hour ago" --no-pager 2>/dev/null | \
+        grep -c "Failed password\|authentication failure" || echo 0)
+    [[ "${fail_count:-0}" -gt 10 ]] && \
+        log_warn "$fail_count failed auth attempts in last hour" || \
+        log_pass "$fail_count failed auth attempts in last hour"
+}
+
+# ── Dispatch ──────────────────────────────────────────────────
+case "$MODE" in
+    diagnose) diagnose ;;
+    report)   network_report ;;
+    firewall) firewall_audit ;;
+esac

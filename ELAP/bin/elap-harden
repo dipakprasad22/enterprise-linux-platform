@@ -1,0 +1,356 @@
+#!/bin/bash
+# ELAP Harden Component
+# Applies CIS Level 1 security hardening controls
+# Usage: elap harden [--level 1|2] [--audit] [--report]
+
+set -euo pipefail
+IFS=$'\n\t'
+
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
+export ELAP_COMPONENT="elap-harden"
+
+# ── Parse arguments ───────────────────────────────────────────
+LEVEL=1
+MODE="harden"    # harden | audit | report
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --level)  LEVEL="$2";   shift 2 ;;
+        --audit)  MODE="audit"; shift   ;;
+        --report) MODE="report";shift   ;;
+        --help)
+            echo "Usage: elap harden [--level 1|2] [--audit] [--report]"
+            echo "  --audit   Check compliance only, do not apply changes"
+            echo "  --report  Generate compliance report file"
+            exit 0 ;;
+        *) log_error "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+elap_require_root
+elap_detect_os
+elap_acquire_lock "elap-harden"
+
+PASS=0; FAIL=0; APPLIED=0
+REPORT_FILE="${ELAP_REPORT_DIR}/cis-compliance-$(date +%Y%m%d-%H%M%S).txt"
+mkdir -p "$ELAP_REPORT_DIR"
+
+log_info "CIS Level $LEVEL hardening — mode: $MODE"
+[[ "${ELAP_DRY_RUN:-false}" == "true" ]] && \
+    log_warn "DRY-RUN enabled — no changes will be made"
+
+# ── Core check function ───────────────────────────────────────
+# Checks a condition, optionally applies a fix
+check_and_fix() {
+    local description="$1"
+    local check_cmd="$2"
+    local fix_cmd="${3:-}"
+
+    if eval "$check_cmd" &>/dev/null; then
+        log_pass "$description"
+        ((PASS++))
+    else
+        log_fail "$description"
+        ((FAIL++))
+        if [[ -n "$fix_cmd" && "$MODE" == "harden" ]]; then
+            elap_run bash -c "$fix_cmd"
+            log_apply "Fixed: $description"
+            ((APPLIED++))
+        fi
+    fi
+}
+
+# ── Check sysctl parameter ────────────────────────────────────
+check_sysctl() {
+    local param="$1" expected="$2" description="$3"
+    local actual
+    actual=$(sysctl -n "$param" 2>/dev/null || echo "MISSING")
+
+    if [[ "$actual" == "$expected" ]]; then
+        log_pass "$description ($param=$actual)"
+        ((PASS++))
+    else
+        log_fail "$description ($param=${actual}, want ${expected})"
+        ((FAIL++))
+        if [[ "$MODE" == "harden" ]]; then
+            elap_run sysctl -w "${param}=${expected}"
+            echo "${param} = ${expected}" >> \
+                /etc/sysctl.d/99-elap-cis.conf
+            log_apply "Set $param=$expected"
+            ((APPLIED++))
+        fi
+    fi
+}
+
+# ── Check SSH config ──────────────────────────────────────────
+check_ssh() {
+    local param="$1" expected="$2" description="$3"
+    local actual
+    actual=$(grep -rh "^${param}" \
+        /etc/ssh/sshd_config \
+        /etc/ssh/sshd_config.d/ \
+        2>/dev/null | awk '{print $2}' | head -1)
+
+    if [[ "${actual,,}" == "${expected,,}" ]]; then
+        log_pass "$description ($param=$actual)"
+        ((PASS++))
+    else
+        log_fail "$description ($param=${actual:-not set}, want $expected)"
+        ((FAIL++))
+        if [[ "$MODE" == "harden" ]]; then
+            mkdir -p /etc/ssh/sshd_config.d
+            echo "${param} ${expected}" >> \
+                /etc/ssh/sshd_config.d/99-elap-cis.conf
+            log_apply "Set SSH $param=$expected"
+            ((APPLIED++))
+        fi
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# CIS LEVEL 1 CONTROLS
+# ═══════════════════════════════════════════════════════════════
+
+elap_section "1. Kernel Security Parameters"
+
+check_sysctl "kernel.randomize_va_space"           "2" "ASLR enabled"
+check_sysctl "kernel.dmesg_restrict"               "1" "dmesg restricted to root"
+check_sysctl "net.ipv4.tcp_syncookies"             "1" "SYN flood protection"
+check_sysctl "net.ipv4.conf.all.accept_redirects"  "0" "ICMP redirects disabled (all)"
+check_sysctl "net.ipv4.conf.all.send_redirects"    "0" "Send redirects disabled"
+check_sysctl "net.ipv4.conf.all.accept_source_route" "0" "Source routing disabled"
+check_sysctl "net.ipv4.conf.all.log_martians"      "1" "Martian packet logging enabled"
+check_sysctl "net.ipv4.icmp_echo_ignore_broadcasts" "1" "Broadcast ping ignored"
+check_sysctl "fs.suid_dumpable"                    "0" "SUID core dumps disabled"
+check_sysctl "fs.protected_symlinks"               "1" "Symlink protection enabled"
+check_sysctl "fs.protected_hardlinks"              "1" "Hardlink protection enabled"
+check_sysctl "kernel.yama.ptrace_scope"            "1" "Ptrace restricted"
+
+elap_section "2. SSH Hardening"
+
+check_ssh "PermitRootLogin"          "no"  "Root SSH login disabled"
+check_ssh "PasswordAuthentication"   "no"  "Password auth disabled"
+check_ssh "PermitEmptyPasswords"     "no"  "Empty passwords denied"
+check_ssh "X11Forwarding"            "no"  "X11 forwarding disabled"
+check_ssh "AllowTcpForwarding"       "no"  "TCP forwarding disabled"
+check_ssh "MaxAuthTries"             "3"   "Max auth tries = 3"
+check_ssh "LoginGraceTime"           "20"  "Login grace time = 20s"
+check_ssh "ClientAliveInterval"      "300" "Client alive interval = 300s"
+check_ssh "ClientAliveCountMax"      "2"   "Client alive max = 2"
+
+# Apply SSH changes:
+if [[ "$MODE" == "harden" && "$APPLIED" -gt 0 ]]; then
+    if sshd -t 2>/dev/null; then
+        elap_run systemctl reload sshd
+        log_apply "sshd reloaded with hardened config"
+    else
+        log_error "sshd config test failed — reload skipped"
+    fi
+fi
+
+elap_section "3. Unnecessary Services"
+
+for svc in telnet rsh rlogin rexec tftp talk ntalk \
+           xinetd nis avahi-daemon cups bluetooth; do
+    if systemctl list-unit-files 2>/dev/null | \
+       grep -q "^${svc}\.service"; then
+        check_and_fix \
+            "Service disabled: $svc" \
+            "! systemctl is-active --quiet $svc 2>/dev/null && \
+             ! systemctl is-enabled --quiet $svc 2>/dev/null" \
+            "systemctl disable --now $svc 2>/dev/null || true"
+    fi
+done
+
+elap_section "4. Filesystem Security"
+
+# Unused filesystem modules:
+for fs in cramfs freevxfs jffs2 hfs hfsplus udf; do
+    check_and_fix \
+        "Module disabled: $fs" \
+        "! lsmod | grep -q '^${fs}'" \
+        "echo 'install ${fs} /bin/true' >> /etc/modprobe.d/elap-disabled-fs.conf"
+done
+
+# /tmp mount options:
+check_and_fix \
+    "/tmp has noexec mount option" \
+    "findmnt /tmp -o OPTIONS 2>/dev/null | grep -q noexec" \
+    "mount -o remount,noexec,nosuid,nodev /tmp"
+
+check_and_fix \
+    "/tmp has nosuid mount option" \
+    "findmnt /tmp -o OPTIONS 2>/dev/null | grep -q nosuid" \
+    ""   # already handled above
+
+elap_section "5. User Account Security"
+
+# No unauthorized UID 0:
+check_and_fix \
+    "No unauthorized UID 0 accounts" \
+    "! awk -F: '\$3==0 && \$1!=\"root\"{exit 0} END{exit 1}' /etc/passwd" \
+    ""   # cannot auto-fix — requires manual intervention
+
+# Password max age:
+MAX_DAYS=$(grep "^PASS_MAX_DAYS" /etc/login.defs 2>/dev/null | awk '{print $2}')
+if [[ "${MAX_DAYS:-99999}" -le 90 ]]; then
+    log_pass "Password max age: $MAX_DAYS days"
+    ((PASS++))
+else
+    log_fail "Password max age too high: ${MAX_DAYS:-not set}"
+    ((FAIL++))
+    if [[ "$MODE" == "harden" ]]; then
+        elap_run sed -i \
+            's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS 90/' \
+            /etc/login.defs
+        log_apply "Set PASS_MAX_DAYS=90"
+        ((APPLIED++))
+    fi
+fi
+
+# Password warn days:
+WARN_DAYS=$(grep "^PASS_WARN_AGE" /etc/login.defs 2>/dev/null | awk '{print $2}')
+if [[ "${WARN_DAYS:-0}" -ge 7 ]]; then
+    log_pass "Password warn age: $WARN_DAYS days"
+    ((PASS++))
+else
+    log_fail "Password warn age too low: ${WARN_DAYS:-not set}"
+    ((FAIL++))
+    if [[ "$MODE" == "harden" ]]; then
+        elap_run sed -i \
+            's/^PASS_WARN_AGE.*/PASS_WARN_AGE 14/' \
+            /etc/login.defs
+        log_apply "Set PASS_WARN_AGE=14"
+        ((APPLIED++))
+    fi
+fi
+
+elap_section "6. Audit Framework"
+
+check_and_fix \
+    "auditd is running" \
+    "systemctl is-active --quiet auditd" \
+    "systemctl enable --now auditd"
+
+# Audit rules count:
+RULE_COUNT=$(auditctl -l 2>/dev/null | \
+    grep -v "^-D\|^No rules" | wc -l)
+if [[ "${RULE_COUNT:-0}" -ge 5 ]]; then
+    log_pass "Audit rules configured ($RULE_COUNT rules)"
+    ((PASS++))
+else
+    log_fail "Insufficient audit rules ($RULE_COUNT)"
+    ((FAIL++))
+    if [[ "$MODE" == "harden" ]]; then
+        # Write enterprise audit rules:
+        cat > /etc/audit/rules.d/99-elap.rules << 'AUDITEOF'
+-D
+-b 8192
+-f 1
+-w /etc/passwd       -p wa -k identity
+-w /etc/shadow       -p wa -k identity
+-w /etc/group        -p wa -k identity
+-w /etc/sudoers      -p wa -k sudoers
+-w /etc/sudoers.d/   -p wa -k sudoers
+-w /etc/ssh/         -p wa -k sshd-config
+-a always,exit -F arch=b64 -S execve -F euid=0 \
+    -F auid!=0 -k privileged-commands
+-w /var/log/lastlog  -p wa -k logins
+-w /etc/cron.d/      -p wa -k cron
+-w /etc/crontab      -p wa -k cron
+AUDITEOF
+        elap_run augenrules --load
+        log_apply "Audit rules installed"
+        ((APPLIED++))
+    fi
+fi
+
+elap_section "7. SELinux / AppArmor"
+
+SELINUX_MODE=$(getenforce 2>/dev/null || echo "Unknown")
+if [[ "$SELINUX_MODE" == "Enforcing" ]]; then
+    log_pass "SELinux is Enforcing"
+    ((PASS++))
+elif [[ "$SELINUX_MODE" == "Permissive" ]]; then
+    log_fail "SELinux is Permissive (should be Enforcing)"
+    ((FAIL++))
+    if [[ "$MODE" == "harden" ]]; then
+        elap_run setenforce 1
+        log_apply "SELinux set to Enforcing"
+        ((APPLIED++))
+    fi
+else
+    log_fail "SELinux is $SELINUX_MODE"
+    ((FAIL++))
+fi
+
+elap_section "8. World-Writable Files"
+
+WW_COUNT=$(find / -xdev -perm -0002 \
+    -not -path "/tmp/*" \
+    -not -path "/proc/*" \
+    -not -path "/sys/*" \
+    -not -path "/dev/*" \
+    -type f 2>/dev/null | wc -l)
+
+if [[ "$WW_COUNT" -eq 0 ]]; then
+    log_pass "No unexpected world-writable files"
+    ((PASS++))
+else
+    log_fail "$WW_COUNT world-writable file(s) outside /tmp"
+    ((FAIL++))
+fi
+
+# ── Level 2 additional controls ───────────────────────────────
+if [[ "$LEVEL" -ge 2 ]]; then
+    elap_section "9. Level 2 — Enhanced Controls"
+
+    check_sysctl "kernel.kptr_restrict"              "2" \
+        "Kernel pointer restriction"
+    check_sysctl "net.core.bpf_jit_harden"          "2" \
+        "BPF JIT hardening"
+    check_sysctl "kernel.unprivileged_bpf_disabled"  "1" \
+        "Unprivileged BPF disabled"
+
+    check_and_fix \
+        "fail2ban installed and running" \
+        "systemctl is-active --quiet fail2ban" \
+        "systemctl enable --now fail2ban 2>/dev/null || true"
+fi
+
+# ── Report generation ─────────────────────────────────────────
+TOTAL=$((PASS + FAIL))
+PCT=0
+[[ $TOTAL -gt 0 ]] && PCT=$((PASS * 100 / TOTAL))
+
+{
+    echo "CIS Level $LEVEL Compliance Report"
+    echo "Generated:  $(date)"
+    echo "Host:       $(hostname -f)"
+    echo "OS:         $(grep PRETTY_NAME /etc/os-release | \
+                        cut -d= -f2 | tr -d '"')"
+    echo "Mode:       $MODE"
+    echo ""
+    echo "Results:"
+    echo "  Passed:          $PASS"
+    echo "  Failed:          $FAIL"
+    echo "  Controls applied: $APPLIED"
+    echo "  Score:           ${PCT}%"
+    echo ""
+    if [[ $PCT -ge 90 ]]; then
+        echo "STATUS: COMPLIANT (${PCT}% >= 90% threshold)"
+    elif [[ $PCT -ge 70 ]]; then
+        echo "STATUS: PARTIALLY COMPLIANT (${PCT}%)"
+    else
+        echo "STATUS: NON-COMPLIANT (${PCT}%)"
+    fi
+} | tee "$REPORT_FILE"
+
+log_info "Compliance score: ${PCT}% ($PASS/$TOTAL)"
+log_info "Report saved: $REPORT_FILE"
+
+elap_notify \
+    "$([[ $PCT -ge 90 ]] && echo SUCCESS || echo WARN)" \
+    "CIS compliance: ${PCT}% on $(hostname -s)"
+
+[[ $FAIL -gt 0 && "$MODE" == "audit" ]] && exit 1 || exit 0

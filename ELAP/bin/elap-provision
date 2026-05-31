@@ -1,0 +1,178 @@
+# ─────────────────────────────────────────────────────────────
+# File: bin/elap-provision
+# Purpose: Provision a new Linux server to enterprise standards
+# ─────────────────────────────────────────────────────────────
+cat > bin/elap-provision << 'PROVEOF'
+#!/bin/bash
+set -euo pipefail
+IFS=$'\n\t'
+
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
+export ELAP_COMPONENT="elap-provision"
+
+# ── Parse arguments ───────────────────────────────────────────
+HOSTNAME=""
+ENVIRONMENT="production"
+ROLE="app"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --hostname) HOSTNAME="$2";     shift 2 ;;
+        --env)      ENVIRONMENT="$2";  shift 2 ;;
+        --role)     ROLE="$2";         shift 2 ;;
+        --help)
+            echo "Usage: elap provision --hostname HOST --env ENV --role ROLE"
+            exit 0 ;;
+        *) log_error "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+[[ -z "$HOSTNAME" ]] && { log_error "--hostname is required"; exit 1; }
+
+elap_require_root
+elap_detect_os
+log_info "Starting server provisioning"
+log_info "Hostname: $HOSTNAME | Environment: $ENVIRONMENT | Role: $ROLE"
+
+# ── Step 1: System updates ────────────────────────────────────
+elap_section "Step 1: System Updates"
+log_info "Applying security updates..."
+
+case "$ELAP_PKG_MGR" in
+    dnf|yum)
+        elap_run "$ELAP_PKG_MGR" update -y --security
+        elap_run "$ELAP_PKG_MGR" install -y \
+            curl wget vim tmux git \
+            net-tools bind-utils \
+            sysstat lsof strace \
+            audit aide fail2ban \
+            policycoreutils-python-utils \
+            2>/dev/null || true
+        ;;
+    apt-get)
+        elap_run apt-get update -qq
+        elap_run apt-get upgrade -y
+        elap_run apt-get install -y \
+            curl wget vim tmux git \
+            net-tools dnsutils \
+            sysstat lsof strace \
+            auditd aide fail2ban \
+            2>/dev/null || true
+        ;;
+esac
+log_info "System updates applied"
+
+# ── Step 2: Hostname configuration ───────────────────────────
+elap_section "Step 2: Hostname"
+log_info "Setting hostname: $HOSTNAME"
+elap_run hostnamectl set-hostname "$HOSTNAME"
+log_apply "Hostname set to: $HOSTNAME"
+
+# ── Step 3: System limits ─────────────────────────────────────
+elap_section "Step 3: System Resource Limits"
+
+elap_run tee /etc/security/limits.d/99-elap.conf > /dev/null << 'LIMEOF'
+# ELAP managed limits — enterprise production defaults
+*           soft    nofile      65536
+*           hard    nofile      65536
+*           soft    nproc       32768
+*           hard    nproc       32768
+*           hard    core        0
+root        soft    nofile      65536
+root        hard    nofile      65536
+LIMEOF
+log_apply "System limits configured"
+
+# ── Step 4: Kernel parameters ─────────────────────────────────
+elap_section "Step 4: Kernel Parameters"
+
+elap_run tee /etc/sysctl.d/99-elap-production.conf > /dev/null << 'SYSCTLEOF'
+# ELAP managed kernel parameters
+# Security:
+kernel.randomize_va_space = 2
+kernel.dmesg_restrict = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.all.log_martians = 1
+fs.suid_dumpable = 0
+fs.protected_symlinks = 1
+fs.protected_hardlinks = 1
+# Performance:
+vm.swappiness = 10
+vm.dirty_ratio = 15
+vm.dirty_background_ratio = 5
+net.core.somaxconn = 65535
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 1024 65535
+fs.file-max = 2097152
+SYSCTLEOF
+
+elap_run sysctl --system > /dev/null
+log_apply "Kernel parameters applied"
+
+# ── Step 5: Service configuration ────────────────────────────
+elap_section "Step 5: Essential Services"
+
+# Enable audit:
+elap_run systemctl enable --now auditd 2>/dev/null || true
+log_apply "auditd enabled"
+
+# Enable sysstat for sar:
+elap_run systemctl enable --now sysstat 2>/dev/null || true
+log_apply "sysstat enabled"
+
+# Disable unnecessary services:
+for svc in bluetooth avahi-daemon cups postfix; do
+    systemctl list-unit-files 2>/dev/null | grep -q "^${svc}" && \
+        elap_run systemctl disable --now "$svc" 2>/dev/null && \
+        log_apply "Disabled: $svc" || true
+done
+
+# ── Step 6: Login banner ──────────────────────────────────────
+elap_section "Step 6: Login Banner"
+
+elap_run tee /etc/issue.net > /dev/null << 'BANNEREOF'
+*************************************************************
+*              AUTHORIZED ACCESS ONLY                       *
+*                                                           *
+*  This system is managed by the ELAP platform.            *
+*  All access is logged, monitored, and audited.           *
+*  Unauthorized access is strictly prohibited.             *
+*                                                           *
+*  By connecting you consent to monitoring.                *
+*************************************************************
+BANNEREOF
+
+log_apply "Login banner configured"
+
+# ── Step 7: Environment file ──────────────────────────────────
+elap_section "Step 7: Environment Configuration"
+
+mkdir -p /etc/elap
+elap_run tee /etc/elap/server.conf > /dev/null << ENVEOF
+# ELAP Server Configuration
+# Generated: $(date)
+ELAP_SERVER_HOSTNAME="$HOSTNAME"
+ELAP_SERVER_ENV="$ENVIRONMENT"
+ELAP_SERVER_ROLE="$ROLE"
+ELAP_PROVISION_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+ELAP_PROVISION_VERSION="$ELAP_VERSION"
+ENVEOF
+log_apply "Server configuration written"
+
+# ── Completion ────────────────────────────────────────────────
+elap_section "Provisioning Complete"
+log_info "Server provisioned successfully"
+log_info "Next steps:"
+log_info "  1. Run: elap harden --level 1"
+log_info "  2. Run: elap monitor --once"
+log_info "  3. Run: elap status"
+
+elap_notify "SUCCESS" "Server $HOSTNAME provisioned ($ENVIRONMENT/$ROLE)"
+PROVEOF
+
+chmod +x bin/elap-provision
+echo "✓ bin/elap-provision created"

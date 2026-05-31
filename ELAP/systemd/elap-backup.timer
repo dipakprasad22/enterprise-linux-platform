@@ -1,0 +1,23 @@
+# Backup timer:
+[Unit]
+Description=ELAP Daily Backup Timer
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target
+EOF
+
+cat > systemd/elap-backup.service << 'EOF'
+[Unit]
+Description=ELAP Backup Service
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/enterprise-linux-platform/bin/elap storage --backup
+StandardOutput=journal
+SyslogIdentifier=elap-backup

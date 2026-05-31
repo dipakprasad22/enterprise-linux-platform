@@ -1,0 +1,169 @@
+# ─────────────────────────────────────────────────────────────
+# File: bin/elap-status
+# Purpose: Quick platform-wide health status
+# ─────────────────────────────────────────────────────────────
+cat > bin/elap-status << 'STATUSEOF'
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
+export ELAP_COMPONENT="elap-status"
+
+OVERALL_STATUS=0
+
+check_item() {
+    local label="$1"
+    local status="$2"   # ok | warn | crit
+    local detail="$3"
+
+    case "$status" in
+        ok)   printf "  ${C_GREEN}●${C_NC} %-30s %s\n" "$label" "$detail" ;;
+        warn) printf "  ${C_YELLOW}●${C_NC} %-30s %s\n" "$label" "$detail"
+              [[ $OVERALL_STATUS -lt 1 ]] && OVERALL_STATUS=1 ;;
+        crit) printf "  ${C_RED}●${C_NC} %-30s %s\n" "$label" "$detail"
+              OVERALL_STATUS=2 ;;
+    esac
+}
+
+echo ""
+printf "${C_BOLD}ELAP Platform Status — $(date '+%Y-%m-%d %H:%M:%S')${C_NC}\n"
+printf "${C_BOLD}Host: $(hostname -f) | OS: $(grep PRETTY_NAME /etc/os-release | \
+    cut -d= -f2 | tr -d '"')${C_NC}\n"
+echo "──────────────────────────────────────────────────"
+
+# ── System health ─────────────────────────────────────────────
+elap_section "System"
+
+CORES=$(nproc)
+LOAD=$(cat /proc/loadavg | awk '{print $1}')
+LOAD_INT="${LOAD%.*}"
+if   [[ "${LOAD_INT:-0}" -gt "$((CORES * 2))" ]]; then
+    check_item "CPU Load" "crit" "Load $LOAD / $CORES cores (CRITICAL)"
+elif [[ "${LOAD_INT:-0}" -gt "$CORES" ]]; then
+    check_item "CPU Load" "warn" "Load $LOAD / $CORES cores (HIGH)"
+else
+    check_item "CPU Load" "ok"   "Load $LOAD / $CORES cores"
+fi
+
+MEM_AVAIL=$(free -m | awk '/Mem/{print $7}')
+MEM_TOTAL=$(free -m | awk '/Mem/{print $2}')
+MEM_PCT=$((MEM_AVAIL * 100 / MEM_TOTAL))
+SWAP_USED=$(free -m | awk '/Swap/{print $3}')
+if   [[ $MEM_PCT -lt 10 ]]; then
+    check_item "Memory" "crit" "${MEM_AVAIL}MB available (${MEM_PCT}%)"
+elif [[ $MEM_PCT -lt 20 ]] || [[ "${SWAP_USED:-0}" -gt 0 ]]; then
+    check_item "Memory" "warn" "${MEM_AVAIL}MB available, ${SWAP_USED}MB swap"
+else
+    check_item "Memory" "ok"   "${MEM_AVAIL}MB available (${MEM_PCT}%)"
+fi
+
+# ── Storage health ────────────────────────────────────────────
+elap_section "Storage"
+
+while IFS= read -r line; do
+    mount=$(echo "$line" | awk '{print $6}')
+    pct=$(echo "$line"   | awk '{print $5}' | tr -d '%')
+    size=$(echo "$line"  | awk '{print $2}')
+    [[ -z "$pct" ]] && continue
+    if   [[ ${pct:-0} -ge 90 ]]; then
+        check_item "Disk $mount" "crit" "${pct}% of ${size}"
+    elif [[ ${pct:-0} -ge 80 ]]; then
+        check_item "Disk $mount" "warn" "${pct}% of ${size}"
+    else
+        check_item "Disk $mount" "ok"   "${pct}% of ${size}"
+    fi
+done < <(df -h | grep -v tmpfs | grep -v devtmpfs | tail -n +2)
+
+# ── Services health ───────────────────────────────────────────
+elap_section "Critical Services"
+
+CRITICAL_SERVICES=("sshd" "rsyslog" "auditd" "chronyd" "crond")
+for svc in "${CRITICAL_SERVICES[@]}"; do
+    if ! systemctl list-unit-files 2>/dev/null | grep -q "^${svc}.service"; then
+        check_item "Service: $svc" "warn" "not installed"
+        continue
+    fi
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        check_item "Service: $svc" "ok" "running"
+    else
+        check_item "Service: $svc" "crit" "NOT RUNNING"
+    fi
+done
+
+FAILED=$(systemctl --failed --no-legend 2>/dev/null | wc -l)
+if [[ "$FAILED" -gt 0 ]]; then
+    check_item "Failed services" "crit" "$FAILED failed"
+    systemctl --failed --no-legend | while read -r line; do
+        printf "    ${C_RED}→${C_NC} %s\n" "$line"
+    done
+else
+    check_item "Failed services" "ok" "none"
+fi
+
+# ── Security status ───────────────────────────────────────────
+elap_section "Security"
+
+SELINUX=$(getenforce 2>/dev/null || echo "Unknown")
+[[ "$SELINUX" == "Enforcing" ]] && \
+    check_item "SELinux" "ok"   "Enforcing" || \
+    check_item "SELinux" "warn" "$SELINUX"
+
+RECENT_FAILS=$(journalctl --since "1 hour ago" --no-pager 2>/dev/null | \
+    grep -c "Failed password\|authentication failure" 2>/dev/null || echo 0)
+[[ "${RECENT_FAILS:-0}" -gt 10 ]] && \
+    check_item "Auth failures (1h)" "warn" "$RECENT_FAILS" || \
+    check_item "Auth failures (1h)" "ok"   "$RECENT_FAILS"
+
+OOM=$(dmesg 2>/dev/null | grep -c "Out of memory\|Killed process" || echo 0)
+[[ "${OOM:-0}" -gt 0 ]] && \
+    check_item "OOM kills" "crit" "$OOM events" || \
+    check_item "OOM kills" "ok"   "none"
+
+# ── Network status ────────────────────────────────────────────
+elap_section "Network"
+
+GW=$(ip route | grep default | awk '{print $3}' | head -1)
+if ping -c 1 -W 2 "${GW:-127.0.0.1}" &>/dev/null 2>&1; then
+    check_item "Gateway" "ok" "$GW reachable"
+else
+    check_item "Gateway" "crit" "${GW:-none} unreachable"
+fi
+
+TIME_WAIT=$(ss -tan state time-wait 2>/dev/null | wc -l)
+[[ "${TIME_WAIT:-0}" -gt 10000 ]] && \
+    check_item "TCP TIME_WAIT" "warn" "$TIME_WAIT connections" || \
+    check_item "TCP TIME_WAIT" "ok"   "$TIME_WAIT connections"
+
+# ── ELAP components ───────────────────────────────────────────
+elap_section "ELAP Components"
+
+ELAP_SERVICES=("elap-monitor" "elap-backup" "elap-compliance")
+for svc in "${ELAP_SERVICES[@]}"; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}"; then
+        if systemctl is-active --quiet "$svc" 2>/dev/null || \
+           systemctl list-units --type=timer 2>/dev/null | grep -q "$svc"; then
+            check_item "ELAP: $svc" "ok" "active"
+        else
+            check_item "ELAP: $svc" "warn" "not running"
+        fi
+    else
+        check_item "ELAP: $svc" "warn" "not installed"
+    fi
+done
+
+# ── Summary ───────────────────────────────────────────────────
+echo ""
+echo "──────────────────────────────────────────────────"
+case $OVERALL_STATUS in
+    0) printf "${C_GREEN}${C_BOLD}PLATFORM STATUS: HEALTHY${C_NC}\n" ;;
+    1) printf "${C_YELLOW}${C_BOLD}PLATFORM STATUS: WARNINGS — review above${C_NC}\n" ;;
+    2) printf "${C_RED}${C_BOLD}PLATFORM STATUS: CRITICAL — immediate action required${C_NC}\n" ;;
+esac
+echo "──────────────────────────────────────────────────"
+echo ""
+
+exit $OVERALL_STATUS
+STATUSEOF
+
+chmod +x bin/elap-status
+echo "✓ bin/elap-status created"

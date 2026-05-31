@@ -1,0 +1,172 @@
+# ─────────────────────────────────────────────────────────────
+# File: bin/elap
+# Purpose: Main CLI entry point for the entire platform
+# ─────────────────────────────────────────────────────────────
+cat > bin/elap << 'ELAPEOF'
+#!/bin/bash
+# ELAP — Enterprise Linux Automation Platform
+# Main CLI orchestrator
+
+set -euo pipefail
+IFS=$'\n\t'
+
+readonly ELAP_BIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+readonly ELAP_HOME=$(cd "$ELAP_BIN_DIR/.." && pwd)
+export ELAP_HOME
+
+source "$ELAP_HOME/lib/common.sh"
+export ELAP_COMPONENT="elap-cli"
+
+elap_detect_os
+
+# ── Usage ─────────────────────────────────────────────────────
+usage() {
+    cat << 'EOF'
+
+  ELAP — Enterprise Linux Automation Platform v1.0.0
+
+  USAGE:
+    elap <command> [options]
+
+  COMMANDS:
+
+    provision     Provision and configure a new server
+      --hostname  Server hostname (required)
+      --env       Environment: production|staging|development
+      --role      Server role: web|app|database|cache
+
+    harden        Apply CIS security hardening
+      --level     CIS level: 1 (default) | 2
+      --audit     Audit only, do not apply changes
+      --report    Generate compliance report
+
+    monitor       Run system health monitoring
+      --once      Run one check and exit
+      --watch     Continuous monitoring mode
+      --report    Generate health report
+
+    storage       Manage storage and LVM
+      --report    Show storage health report
+      --expand    Auto-expand volumes above threshold
+      --backup    Run backup for all configured targets
+
+    network       Network diagnostics and reporting
+      --diagnose  Full layer-by-layer diagnosis
+      --report    Generate network health report
+
+    users         User lifecycle management
+      --provision USERNAME ROLE   Create new user
+      --offboard  USERNAME        Offboard departing user
+      --audit     Audit all user accounts and permissions
+
+    performance   Performance baseline and tuning
+      --baseline  Collect and display performance baseline
+      --tune      Apply recommended kernel tuning
+      --diagnose  Run full performance diagnosis
+
+    report        Generate comprehensive platform report
+      --format    Output format: text (default) | json | html
+      --email     Email report to configured address
+
+    status        Show overall platform status (quick health check)
+
+  GLOBAL OPTIONS:
+    --dry-run     Simulate all actions without making changes
+    --debug       Enable verbose debug output
+    --no-color    Disable colored output
+    --help        Show this help
+
+  EXAMPLES:
+    elap provision --hostname web01.prod --env production --role web
+    elap harden --audit
+    elap monitor --once
+    elap storage --expand
+    elap report --format html
+    elap status
+
+  ENVIRONMENT:
+    ELAP_DRY_RUN=true    Enable dry-run mode
+    ELAP_DEBUG=true      Enable debug output
+    ELAP_WEBHOOK=URL     Slack/Teams webhook for notifications
+
+EOF
+    exit 0
+}
+
+# ── Parse global options ──────────────────────────────────────
+ELAP_DRY_RUN="${ELAP_DRY_RUN:-false}"
+ELAP_DEBUG="${ELAP_DEBUG:-false}"
+COMMAND=""
+COMMAND_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)  export ELAP_DRY_RUN=true; shift ;;
+        --debug)    export ELAP_DEBUG=true;    shift ;;
+        --no-color) unset C_RED C_GREEN C_YELLOW C_BLUE C_NC C_BOLD; shift ;;
+        --help|-h)  usage ;;
+        status|provision|harden|monitor|storage|network|users|performance|report)
+            COMMAND="$1"; shift
+            COMMAND_ARGS=("$@")
+            break
+            ;;
+        *)
+            log_error "Unknown command: $1"
+            echo "Run 'elap --help' for usage"
+            exit 1
+            ;;
+    esac
+done
+
+[[ -z "$COMMAND" ]] && usage
+
+elap_banner "$(echo "$COMMAND" | tr '[:lower:]' '[:upper:]')"
+[[ "$ELAP_DRY_RUN" == "true" ]] && log_warn "DRY-RUN MODE — no changes will be made"
+
+# ── Route to appropriate component ───────────────────────────
+case "$COMMAND" in
+    status)
+        export ELAP_COMPONENT="elap-status"
+        exec "$ELAP_HOME/bin/elap-status" "${COMMAND_ARGS[@]:-}"
+        ;;
+    provision)
+        elap_require_root
+        export ELAP_COMPONENT="elap-provision"
+        exec "$ELAP_HOME/bin/elap-provision" "${COMMAND_ARGS[@]:-}"
+        ;;
+    harden)
+        elap_require_root
+        export ELAP_COMPONENT="elap-harden"
+        exec "$ELAP_HOME/bin/elap-harden" "${COMMAND_ARGS[@]:-}"
+        ;;
+    monitor)
+        export ELAP_COMPONENT="elap-monitor"
+        exec "$ELAP_HOME/bin/elap-monitor" "${COMMAND_ARGS[@]:-}"
+        ;;
+    storage)
+        elap_require_root
+        export ELAP_COMPONENT="elap-storage"
+        exec "$ELAP_HOME/bin/elap-storage" "${COMMAND_ARGS[@]:-}"
+        ;;
+    network)
+        export ELAP_COMPONENT="elap-network"
+        exec "$ELAP_HOME/bin/elap-network" "${COMMAND_ARGS[@]:-}"
+        ;;
+    users)
+        elap_require_root
+        export ELAP_COMPONENT="elap-users"
+        exec "$ELAP_HOME/bin/elap-users" "${COMMAND_ARGS[@]:-}"
+        ;;
+    performance)
+        export ELAP_COMPONENT="elap-performance"
+        exec "$ELAP_HOME/bin/elap-performance" "${COMMAND_ARGS[@]:-}"
+        ;;
+    report)
+        export ELAP_COMPONENT="elap-report"
+        exec "$ELAP_HOME/bin/elap-report" "${COMMAND_ARGS[@]:-}"
+        ;;
+esac
+ELAPEOF
+
+chmod +x bin/elap
+echo "✓ bin/elap created"

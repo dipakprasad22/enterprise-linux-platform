@@ -1,0 +1,286 @@
+#!/bin/bash
+# ELAP Users Component
+# Enterprise user lifecycle management
+# Usage: elap users [--provision USER ROLE] [--offboard USER] [--audit]
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# shellcheck disable=SC1091
+# shellcheck source=../lib/common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
+export ELAP_COMPONENT="elap-users"
+
+elap_require_root
+
+MODE="audit"
+TARGET_USER=""
+TARGET_ROLE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --provision) MODE="provision"
+                     TARGET_USER="${2:-}"
+                     TARGET_ROLE="${3:-developer}"
+                     shift 3 ;;
+        --offboard)  MODE="offboard"
+                     TARGET_USER="${2:-}"
+                     shift 2 ;;
+        --audit)     MODE="audit"; shift ;;
+        --help)
+            echo "Usage: elap users [--provision USER ROLE|--offboard USER|--audit]"
+            echo "Roles: devops | developer | dba | readonly"
+            exit 0 ;;
+        *) log_error "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+AUDIT_LOG="/var/log/elap/user-management.log"
+ARCHIVE_DIR="/archive/users"
+
+# ── User provisioning ─────────────────────────────────────────
+provision_user() {
+    local username="$1" role="$2"
+
+    [[ -z "$username" ]] && {
+        log_error "Username is required"
+        exit 1
+    }
+
+    # Validate username format:
+    [[ "$username" =~ ^[a-z][a-z0-9_-]{2,31}$ ]] || {
+        log_error "Invalid username format: $username"
+        exit 1
+    }
+
+    # Check user does not already exist:
+    id "$username" &>/dev/null && {
+        log_error "User already exists: $username"
+        exit 1
+    }
+
+    log_info "Provisioning user: $username (role: $role)"
+
+    # Create the user:
+    elap_run useradd \
+        -m \
+        -s /bin/bash \
+        -c "ELAP managed user — role: $role" \
+        "$username"
+
+    # Role-based group assignment:
+    case "$role" in
+        devops)
+            elap_run usermod -aG wheel,developers,devops "$username" \
+                2>/dev/null || true
+            log_apply "Added to groups: wheel, developers, devops"
+            ;;
+        developer)
+            elap_run usermod -aG developers "$username" \
+                2>/dev/null || true
+            log_apply "Added to groups: developers"
+            ;;
+        dba)
+            elap_run usermod -aG dba "$username" \
+                2>/dev/null || true
+            log_apply "Added to groups: dba"
+            ;;
+        readonly)
+            elap_run usermod -aG readonly "$username" \
+                2>/dev/null || true
+            log_apply "Added to groups: readonly"
+            ;;
+        *)
+            log_warn "Unknown role: $role — no supplementary groups assigned"
+            ;;
+    esac
+
+    # Generate secure temporary password:
+    local temp_pass
+    temp_pass=$(openssl rand -base64 16 | tr -d "=+/" | cut -c1-16)
+    echo "${username}:${temp_pass}" | chpasswd
+    chage -d 0 "$username"      # force password change at first login
+    chage -M 90 "$username"     # 90 day max age (PCI-DSS)
+    chage -W 14 "$username"     # warn 14 days before expiry
+    chage -I 7  "$username"     # lock 7 days after expiry
+
+    # Set up SSH directory:
+    local ssh_dir="/home/${username}/.ssh"
+    elap_run mkdir -p "$ssh_dir"
+    elap_run touch "${ssh_dir}/authorized_keys"
+    elap_run chmod 700 "$ssh_dir"
+    elap_run chmod 600 "${ssh_dir}/authorized_keys"
+    elap_run chown -R "${username}:${username}" "$ssh_dir"
+
+    # Set up bash profile:
+    cat > "/home/${username}/.bash_profile" << 'BASHEOF'
+# ELAP managed bash profile
+export PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+export HISTSIZE=10000
+export HISTTIMEFORMAT="%F %T "
+export HISTCONTROL=ignoredups
+shopt -s histappend
+PROMPT_COMMAND='history -a'
+alias ll='ls -alF'
+umask 027
+BASHEOF
+    chown "${username}:${username}" "/home/${username}/.bash_profile"
+
+    log_apply "User provisioned: $username"
+    log_info "Temporary password: $temp_pass"
+    log_info "User must change password at first login"
+    log_info "Add SSH public key to: ${ssh_dir}/authorized_keys"
+
+    elap_notify "SUCCESS" "User $username provisioned (role: $role)"
+}
+
+# ── User offboarding ──────────────────────────────────────────
+offboard_user() {
+    local username="$1"
+
+    [[ -z "$username" ]] && {
+        log_error "Username is required"
+        exit 1
+    }
+
+    id "$username" &>/dev/null || {
+        log_error "User does not exist: $username"
+        exit 1
+    }
+
+    log_info "Offboarding user: $username"
+
+    # Step 1: Immediately lock and remove shell:
+    elap_run passwd -l "$username"
+    elap_run usermod -s /sbin/nologin "$username"
+    log_apply "Account locked and shell removed"
+
+    # Step 2: Kill active sessions:
+    pkill -u "$username" 2>/dev/null && \
+        log_apply "Active sessions terminated" || true
+
+    # Step 3: Archive home directory:
+    mkdir -p "$ARCHIVE_DIR"
+    local archive="${ARCHIVE_DIR}/${username}-$(date +%Y%m%d).tar.gz"
+    if [[ -d "/home/${username}" ]]; then
+        tar czf "$archive" "/home/${username}/" 2>/dev/null
+        chmod 400 "$archive"
+        log_apply "Home directory archived: $archive"
+    fi
+
+    # Step 4: Document all owned files:
+    find / -xdev -user "$username" 2>/dev/null | \
+        tee "/var/log/elap/offboard-${username}-$(date +%Y%m%d).txt" \
+        > /dev/null
+    log_apply "Owned files documented"
+
+    # Step 5: Remove cron jobs:
+    crontab -r -u "$username" 2>/dev/null && \
+        log_apply "Cron jobs removed" || true
+
+    # Step 6: Clear authorized_keys:
+    local keyfile="/home/${username}/.ssh/authorized_keys"
+    [[ -f "$keyfile" ]] && > "$keyfile" && \
+        log_apply "SSH keys revoked"
+
+    log_info "Offboarding complete: $username"
+    log_info "Archive: $archive"
+    log_warn "Manual steps required:"
+    log_warn "  - Remove from Active Directory / LDAP"
+    log_warn "  - Revoke VPN access"
+    log_warn "  - Disable email account"
+    log_warn "  - Review and transfer any shared resources"
+
+    elap_notify "SUCCESS" "User $username offboarded on $(hostname -s)"
+}
+
+# ── User security audit ───────────────────────────────────────
+audit_users() {
+    elap_section "User Account Security Audit"
+    echo "Generated: $(date)"
+    echo "Host: $(hostname -f)"
+
+    elap_section "Accounts With Login Shells"
+    grep -v -e '/nologin' -e '/false' /etc/passwd | \
+        awk -F: '{printf "  %-20s UID:%-6s Shell:%s\n",$1,$3,$7}'
+
+    elap_section "UID 0 Accounts (CRITICAL — only root expected)"
+    local uid0_count=0
+    while IFS=: read -r user _ uid _; do
+        [[ "$uid" -eq 0 ]] || continue
+        [[ "$user" == "root" ]] && continue
+        log_error "UNAUTHORIZED UID 0: $user"
+        ((uid0_count++))
+    done < /etc/passwd
+    [[ $uid0_count -eq 0 ]] && log_pass "No unauthorized UID 0 accounts"
+
+    elap_section "Accounts With Empty Passwords"
+    local empty_count=0
+    while IFS=: read -r user pass _; do
+        [[ -z "$pass" || "$pass" == "!" || "$pass" == "*" ]] && \
+            continue
+        [[ "$pass" == "" ]] && {
+            log_error "EMPTY PASSWORD: $user"
+            ((empty_count++))
+        }
+    done < /etc/shadow 2>/dev/null
+    [[ $empty_count -eq 0 ]] && log_pass "No accounts with empty passwords"
+
+    elap_section "Password Aging Compliance (90-day max)"
+    while IFS=: read -r user _ last _ max _; do
+        [[ -z "$max" || "$max" -eq 99999 ]] 2>/dev/null && continue
+        [[ -z "$last" || "$last" -eq 0 ]] 2>/dev/null && continue
+        local today days_left
+        today=$(( $(date +%s) / 86400 ))
+        days_left=$(( last + max - today ))
+        [[ "${days_left:-999}" -lt 14 ]] 2>/dev/null && \
+            log_warn "$user: password expires in $days_left days"
+    done < /etc/shadow 2>/dev/null
+
+    elap_section "sudo Access Summary"
+    grep -r \
+        --include="*.conf" \
+        -h "ALL.*ALL" \
+        /etc/sudoers \
+        /etc/sudoers.d/ \
+        2>/dev/null | \
+        grep -v "^#" | \
+        sed 's/^/  /'
+
+    elap_section "SSH Authorized Keys Inventory"
+    for home_dir in /home/* /root; do
+        local keyfile="${home_dir}/.ssh/authorized_keys"
+        [[ -f "$keyfile" ]] || continue
+        local user
+        user=$(basename "$home_dir")
+        local count perms
+        count=$(grep -c "^ssh-\|^ecdsa\|^sk-" "$keyfile" 2>/dev/null || echo 0)
+        perms=$(stat -c "%a" "$keyfile" 2>/dev/null || echo "?")
+        local perm_flag=""
+        [[ "$perms" != "600" ]] && perm_flag=" [WRONG PERMISSIONS: $perms]"
+        printf "  %-20s %d key(s)%s\n" "$user:" "$count" "$perm_flag"
+    done
+
+    elap_section "Recently Modified Account Files"
+    find /etc/passwd /etc/shadow /etc/group /etc/sudoers \
+        -newer /proc/1/exe \
+        -ls 2>/dev/null | \
+        awk '{print "  RECENTLY MODIFIED:", $NF}' || \
+        echo "  No recent modifications detected"
+
+    elap_section "Locked Accounts"
+    awk -F: '$2 ~ /^!/{print "  Locked:", $1}' /etc/shadow 2>/dev/null
+
+    elap_section "Last Login Summary"
+    lastlog 2>/dev/null | \
+        grep -v "Never logged in\|Username" | \
+        head -20 | \
+        awk '{printf "  %-20s %s %s %s %s\n",$1,$4,$5,$6,$7}'
+}
+
+# ── Dispatch ──────────────────────────────────────────────────
+case "$MODE" in
+    provision) provision_user "$TARGET_USER" "$TARGET_ROLE" ;;
+    offboard)  offboard_user  "$TARGET_USER" ;;
+    audit)     audit_users ;;
+esac
