@@ -1,8 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
 # Enterprise LVM Storage Management Tool
-# File: storage/lvm-manager.sh
-# Part of: enterprise-linux-platform
 # Features:
 #   - Storage health report
 #   - Automated LV expansion when threshold exceeded

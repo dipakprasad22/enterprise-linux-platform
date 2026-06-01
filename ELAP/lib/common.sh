@@ -1,7 +1,6 @@
 #!/bin/bash
 # shellcheck shell=bash
 # ─────────────────────────────────────────────────────────────
-# File: lib/common.sh
 # Purpose: Shared functions used by all ELAP components
 # ─────────────────────────────────────────────────────────────
 cat > lib/common.sh << 'COMMONEOF'

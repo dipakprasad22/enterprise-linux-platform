@@ -1,5 +1,4 @@
 #!/bin/bash
-# linux-user-security-audit.sh
 # Produces a security audit report of user accounts and permissions
 
 set -euo pipefail

@@ -1,8 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
 # Enterprise Package Inventory and Integrity Audit Tool
-# File: packages/package-audit.sh
-# Part of: enterprise-linux-platform
 #
 # Features:
 #   - Complete package inventory (installed, versions, sizes)

@@ -1,8 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
 # Enterprise Backup and Log Rotation System
-# File: automation/backup-manager.sh
-# Part of: enterprise-linux-platform
 #
 # Features:
 #   - Configurable backup targets (dirs, databases)

@@ -1,8 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
 # Enterprise CIS Benchmark Hardening Tool
-# File: security/cis-hardening.sh
-# Part of: enterprise-linux-platform
 #
 # Modes:
 #   audit   = check compliance, do not change anything

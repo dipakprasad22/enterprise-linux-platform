@@ -1,5 +1,4 @@
 #!/bin/bash
-# enterprise-user-provision.sh
 # Provision a new user following enterprise security standards
 
 set -euo pipefail

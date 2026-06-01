@@ -1,8 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
 # Enterprise Process Monitor and Auto-Remediation Tool
-# File: processes/process-monitor.sh
-# Part of: enterprise-linux-platform
 # Features:
 #   - Monitor critical processes and restart if dead
 #   - Detect and alert on high CPU processes

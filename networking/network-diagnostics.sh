@@ -1,8 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
 # Enterprise Network Diagnostics and Security Checker
-# File: networking/network-diagnostics.sh
-# Part of: enterprise-linux-platform
 # Features:
 #   - Layer-by-layer connectivity diagnosis
 #   - Firewall rule audit

@@ -1,8 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
 # Enterprise Performance Baseline and Tuning Report
-# File: performance/perf-baseline.sh
-# Part of: enterprise-linux-platform
 #
 # Usage:
 #   ./perf-baseline.sh             # generate baseline report
